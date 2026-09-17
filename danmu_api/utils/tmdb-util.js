@@ -584,7 +584,7 @@ export async function getTmdbJaOriginalTitle(title, signal = null, sourceLabel =
  * @param {number|string} episode - 集数（可选）
  * @returns {Promise<string>} 返回中文标题，如果查询失败则返回原标题
  */
-export async function getTMDBChineseTitle(title, season = null, episode = null) {
+
   /**
  * 查询 TMDB 获取可靠的中文标题
  *
@@ -1236,8 +1236,6 @@ export async function getTMDBChineseTitle(title, season = null, episode = null) 
 
     return originalInput;
   }
-}
-
 }
 
 // =====================
