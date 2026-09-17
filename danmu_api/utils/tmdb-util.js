@@ -585,65 +585,659 @@ export async function getTmdbJaOriginalTitle(title, signal = null, sourceLabel =
  * @returns {Promise<string>} 返回中文标题，如果查询失败则返回原标题
  */
 export async function getTMDBChineseTitle(title, season = null, episode = null) {
-  // 如果包含中文，直接返回原标题
-  if (!isNonChinese(title)) {
+  /**
+ * 查询 TMDB 获取可靠的中文标题
+ *
+ * 核心思路：
+ * 1. 先确定“英文标题对应的是哪一个 TMDB 条目”
+ * 2. 再从这个确定的条目中读取中文别名
+ * 3. 不再使用“搜索结果中第一个中文标题”这种高风险逻辑
+ *
+ * @param {string} title - 原始标题
+ * @param {number|string} season - 季数（可选）
+ * @param {number|string} episode - 集数（可选）
+ * @returns {Promise<string>} 返回中文标题，失败则返回原标题
+ */
+export async function getTMDBChineseTitle(title, season = null, episode = null) {
+  // -----------------------------
+  // 0. 基础检查
+  // -----------------------------
+
+  if (!title || typeof title !== 'string') {
     return title;
   }
 
-// 优先尝试本地 Bangumi Data 转换
+  const originalInput = title.trim();
+
+  if (!originalInput) {
+    return title;
+  }
+
+  // 已经包含中文，不需要转换
+  if (!isNonChinese(originalInput)) {
+    return originalInput;
+  }
+
+  // 清理季度等后缀，例如：
+  // "The Last of Us Season 2" -> "The Last of Us"
+  // "Chainsaw Man S01" -> "Chainsaw Man"
+  const cleanTitle = cleanSearchQuery(originalInput).trim();
+
+  if (!cleanTitle) {
+    return originalInput;
+  }
+
+  if (cleanTitle !== originalInput) {
+    log(
+      "info",
+      `[system] [tmdb] 中文标题转换：清理搜索词 "${originalInput}" -> "${cleanTitle}"`
+    );
+  }
+
+  // -----------------------------
+  // 1. 优先使用 Bangumi Data
+  // -----------------------------
+  //
+  // 注意：
+  // 原来的代码直接 localMatches[0]，
+  // 这里增加了“精确标题优先”的排序，
+  // 避免类似：
+  //   Gundam 00
+  //   Gundam 0079
+  // 这种子串误匹配。
+  //
+
   if (globals.useBangumiData) {
-    const cleanTitle = cleanSearchQuery(title);
-    const localMatches = await searchBangumiData(cleanTitle, ['tmdb', 'bangumi', 'anidb']);
-    if (localMatches && localMatches.length > 0) {
-      const m = localMatches[0];
-      // 找一个不全是外文的翻译作为中文名
-      const displayTitle = m.titles.find(t => t && !isNonChinese(t)) || m.titles[1];
-      if (displayTitle && !isNonChinese(displayTitle)) {
-        log("info", `[system] [tmdb] 命中本地 Bangumi Data: ${title} -> ${displayTitle}（检索词：${cleanTitle}）`);
-        return displayTitle;
+    try {
+      const localMatches = await searchBangumiData(
+        cleanTitle,
+        ['tmdb', 'bangumi', 'anidb']
+      );
+
+      if (localMatches && localMatches.length > 0) {
+
+        const normalizeTitle = (value) => {
+          if (!value) return "";
+
+          return String(value)
+            .toLowerCase()
+            .replace(/[\s._\-:：·'’"“”!?！？（）()【】\[\]《》]/g, "")
+            .trim();
+        };
+
+        const normalizedQuery = normalizeTitle(cleanTitle);
+
+        // 对本地结果进行更严格排序
+        const rankedMatches = [...localMatches].sort((a, b) => {
+
+          const scoreMatch = (item) => {
+            const titles = Array.isArray(item?.titles)
+              ? item.titles.filter(Boolean)
+              : [];
+
+            let best = 0;
+
+            for (const t of titles) {
+              const normalized = normalizeTitle(t);
+
+              if (!normalized) continue;
+
+              // 完全一致
+              if (normalized === normalizedQuery) {
+                best = Math.max(best, 100);
+                continue;
+              }
+
+              // 原标题完全包含查询词
+              if (
+                normalized.includes(normalizedQuery) ||
+                normalizedQuery.includes(normalized)
+              ) {
+                best = Math.max(best, 70);
+                continue;
+              }
+
+              // 简单前缀匹配
+              if (
+                normalized.startsWith(normalizedQuery) ||
+                normalizedQuery.startsWith(normalized)
+              ) {
+                best = Math.max(best, 60);
+              }
+            }
+
+            return best;
+          };
+
+          return scoreMatch(b) - scoreMatch(a);
+        });
+
+        const bestMatch = rankedMatches[0];
+
+        if (bestMatch) {
+
+          const titles = Array.isArray(bestMatch.titles)
+            ? bestMatch.titles.filter(Boolean)
+            : [];
+
+          // 优先寻找真正的中文标题
+          const chineseCandidates = titles.filter(
+            t => t && !isNonChinese(t)
+          );
+
+          if (chineseCandidates.length > 0) {
+
+            // 优先选择：
+            // 1. 最常见的短中文标题
+            // 2. 避免选择明显的长描述
+            const displayTitle =
+              chineseCandidates
+                .sort((a, b) => {
+                  const aLen = String(a).length;
+                  const bLen = String(b).length;
+
+                  // 略微偏向较短、较像正式片名的标题
+                  if (aLen !== bLen) {
+                    return aLen - bLen;
+                  }
+
+                  return 0;
+                })[0];
+
+            if (displayTitle) {
+              log(
+                "info",
+                `[system] [tmdb] Bangumi Data 精确命中: ${cleanTitle} -> ${displayTitle}`
+              );
+
+              return displayTitle;
+            }
+          }
+        }
+
       }
+    } catch (error) {
+      log(
+        "warn",
+        `[system] [tmdb] Bangumi Data 标题转换失败: ${error.message}`
+      );
     }
   }
 
-  // 判断是电影还是电视剧
-  const isTV = season !== null && season !== undefined;
-  const mediaType = isTV ? 'tv' : 'movie';
+  // -----------------------------
+  // 2. 没有 Bangumi Data 命中
+  //    使用 TMDB
+  // -----------------------------
+
+  if (!globals.tmdbApiKey) {
+    log(
+      "info",
+      `[system] [tmdb] 未配置 TMDB API Key，无法进行英文标题转换: ${cleanTitle}`
+    );
+
+    return originalInput;
+  }
 
   try {
-    // 搜索媒体内容
-    const searchResponse = await searchTmdbTitles(title, mediaType);
 
-    // 检查是否有结果
-    if (!searchResponse.data.results || searchResponse.data.results.length === 0) {
-      log("info", '[system] [tmdb] TMDB未找到任何结果');
-      return title;
+    // ---------------------------------
+    // 3. 根据是否存在 season 决定搜索类型
+    // ---------------------------------
+
+    const isTV = season !== null && season !== undefined;
+
+    const mediaType = isTV ? "tv" : "movie";
+
+    log(
+      "info",
+      `[system] [tmdb] 开始可靠标题匹配: "${cleanTitle}" (${mediaType})`
+    );
+
+    const searchResponse = await searchTmdbTitles(
+      cleanTitle,
+      mediaType
+    );
+
+    if (
+      !searchResponse ||
+      !searchResponse.data ||
+      !Array.isArray(searchResponse.data.results) ||
+      searchResponse.data.results.length === 0
+    ) {
+      log(
+        "info",
+        `[system] [tmdb] 没有找到英文标题对应的 TMDB 结果: ${cleanTitle}`
+      );
+
+      return originalInput;
     }
 
-    // 获取第一个匹配结果的 ID
-    // 查找第一个 name/title 包含中文的结果
-    const firstResult = searchResponse.data.results.find(result => {
-      const resultName = isTV ? result.name : result.title;
-      return resultName && !isNonChinese(resultName);
-    });
+    const results = searchResponse.data.results;
 
-    // 如果没有找到包含中文的结果，使用第一个结果
-    const selectedResult = firstResult || searchResponse.data.results[0];
+    // ---------------------------------
+    // 4. 标题标准化
+    // ---------------------------------
 
-    // 电视剧使用 name 字段，电影使用 title 字段
-    const chineseTitle = isTV ? selectedResult.name : selectedResult.title;
+    const normalizeTitle = (value) => {
+      if (!value) return "";
 
-    // 如果有中文标题则返回，否则返回原标题
-    if (chineseTitle) {
-      log("info", `原标题: ${title} -> 中文标题: ${chineseTitle}`);
-      return chineseTitle;
-    } else {
-      return title;
+      return String(value)
+        .toLowerCase()
+        .normalize("NFKC")
+        .replace(/[\s._\-:：·'’"“”!?！？（）()【】《》\[\]]/g, "")
+        .trim();
+    };
+
+    const normalizedQuery = normalizeTitle(cleanTitle);
+
+    // ---------------------------------
+    // 5. 计算 TMDB 搜索结果的匹配分数
+    // ---------------------------------
+
+    const calculateScore = (result) => {
+
+      const names = [
+        result.name,
+        result.title,
+        result.original_name,
+        result.original_title
+      ].filter(Boolean);
+
+      let bestScore = 0;
+
+      for (const name of names) {
+
+        const normalizedName = normalizeTitle(name);
+
+        if (!normalizedName) continue;
+
+        // -----------------------------
+        // A. 完全一致 —— 最高优先级
+        // -----------------------------
+
+        if (normalizedName === normalizedQuery) {
+          bestScore = Math.max(bestScore, 1000);
+          continue;
+        }
+
+        // -----------------------------
+        // B. 完全匹配（忽略标点）
+        // -----------------------------
+
+        if (
+          normalizedName.replace(/[0-9]/g, "") ===
+          normalizedQuery.replace(/[0-9]/g, "")
+        ) {
+          bestScore = Math.max(bestScore, 900);
+          continue;
+        }
+
+        // -----------------------------
+        // C. 包含关系
+        // -----------------------------
+
+        if (
+          normalizedName.includes(normalizedQuery) ||
+          normalizedQuery.includes(normalizedName)
+        ) {
+
+          const shorter = Math.min(
+            normalizedName.length,
+            normalizedQuery.length
+          );
+
+          const longer = Math.max(
+            normalizedName.length,
+            normalizedQuery.length
+          );
+
+          const ratio = shorter / longer;
+
+          bestScore = Math.max(
+            bestScore,
+            600 + ratio * 200
+          );
+
+          continue;
+        }
+
+        // -----------------------------
+        // D. 简单编辑距离
+        // -----------------------------
+
+        const a = normalizedQuery;
+        const b = normalizedName;
+
+        const matrix = Array.from(
+          { length: a.length + 1 },
+          () => new Array(b.length + 1).fill(0)
+        );
+
+        for (let i = 0; i <= a.length; i++) {
+          matrix[i][0] = i;
+        }
+
+        for (let j = 0; j <= b.length; j++) {
+          matrix[0][j] = j;
+        }
+
+        for (let i = 1; i <= a.length; i++) {
+
+          for (let j = 1; j <= b.length; j++) {
+
+            const cost =
+              a[i - 1] === b[j - 1] ? 0 : 1;
+
+            matrix[i][j] = Math.min(
+              matrix[i - 1][j] + 1,
+              matrix[i][j - 1] + 1,
+              matrix[i - 1][j - 1] + cost
+            );
+          }
+        }
+
+        const distance = matrix[a.length][b.length];
+
+        const maxLength = Math.max(
+          a.length,
+          b.length
+        );
+
+        if (maxLength > 0) {
+
+          const similarity =
+            1 - distance / maxLength;
+
+          bestScore = Math.max(
+            bestScore,
+            similarity * 500
+          );
+        }
+      }
+
+      // ---------------------------------
+      // 6. 年份辅助判断
+      // ---------------------------------
+
+      const releaseDate =
+        result.first_air_date ||
+        result.release_date ||
+        "";
+
+      const yearMatch =
+        cleanTitle.match(/\b(19|20)\d{2}\b/);
+
+      if (yearMatch && releaseDate) {
+
+        const queryYear = parseInt(
+          yearMatch[0],
+          10
+        );
+
+        const resultYear = parseInt(
+          releaseDate.substring(0, 4),
+          10
+        );
+
+        if (
+          queryYear === resultYear
+        ) {
+          bestScore += 150;
+        }
+      }
+
+      // ---------------------------------
+      // 7. 人气作为非常弱的辅助因素
+      // ---------------------------------
+
+      if (result.popularity) {
+
+        const popularityBonus =
+          Math.min(
+            Math.log10(
+              Math.max(result.popularity, 1)
+            ) * 5,
+            25
+          );
+
+        bestScore += popularityBonus;
+      }
+
+      return bestScore;
+    };
+
+    // ---------------------------------
+    // 8. 对所有候选进行评分
+    // ---------------------------------
+
+    const rankedResults = results
+      .map(result => ({
+        result,
+        score: calculateScore(result)
+      }))
+      .sort((a, b) => b.score - a.score);
+
+    // ---------------------------------
+    // 9. 取最佳匹配
+    // ---------------------------------
+
+    const best = rankedResults[0];
+
+    if (!best || !best.result) {
+
+      log(
+        "info",
+        `[system] [tmdb] 无法确定 "${cleanTitle}" 对应的作品`
+      );
+
+      return originalInput;
     }
+
+    const selectedResult = best.result;
+
+    const selectedTitle =
+      selectedResult.name ||
+      selectedResult.title ||
+      "";
+
+    const selectedOriginalTitle =
+      selectedResult.original_name ||
+      selectedResult.original_title ||
+      "";
+
+    log(
+      "info",
+      `[system] [tmdb] 最佳作品候选: "${selectedTitle}" / 原名: "${selectedOriginalTitle}" / 得分: ${best.score.toFixed(2)}`
+    );
+
+    // ---------------------------------
+    // 10. 安全检查
+    // ---------------------------------
+
+    //
+    // 如果完全没有任何可靠的标题命中，
+    // 不要因为“第一个搜索结果”就强行转换。
+    //
+
+    if (best.score < 500) {
+
+      log(
+        "info",
+        `[system] [tmdb] "${cleanTitle}" 没有达到可靠匹配阈值，拒绝强制转换`
+      );
+
+      return originalInput;
+    }
+
+    // ---------------------------------
+    // 11. 获取该作品自己的中文别名
+    // ---------------------------------
+
+    const resultMediaType =
+      selectedResult.media_type ||
+      mediaType;
+
+    let alternativeResponse = null;
+
+    try {
+
+      alternativeResponse =
+        await getTmdbAlternativeTitles(
+          resultMediaType,
+          selectedResult.id
+        );
+
+    } catch (error) {
+
+      log(
+        "warn",
+        `[system] [tmdb] 获取作品中文别名失败: ${error.message}`
+      );
+    }
+
+    if (
+      alternativeResponse &&
+      alternativeResponse.data
+    ) {
+
+      const titles =
+        alternativeResponse.data.results ||
+        alternativeResponse.data.titles ||
+        [];
+
+      if (Array.isArray(titles)) {
+
+        // ---------------------------------
+        // 12. 中文别名优先级
+        //
+        // CN > TW > HK > SG > 其他中文
+        // ---------------------------------
+
+        const chineseTitles =
+          titles.filter(item => {
+
+            const value =
+              item?.title ||
+              item?.name ||
+              "";
+
+            return (
+              value &&
+              !isNonChinese(value)
+            );
+          });
+
+        if (chineseTitles.length > 0) {
+
+          const regionPriority = {
+            CN: 100,
+            TW: 90,
+            HK: 80,
+            SG: 70
+          };
+
+          chineseTitles.sort((a, b) => {
+
+            const aRegion =
+              a.iso_3166_1 ||
+              a.iso_639_1 ||
+              "";
+
+            const bRegion =
+              b.iso_3166_1 ||
+              b.iso_639_1 ||
+              "";
+
+            const aPriority =
+              regionPriority[aRegion] || 10;
+
+            const bPriority =
+              regionPriority[bRegion] || 10;
+
+            if (
+              aPriority !== bPriority
+            ) {
+              return bPriority - aPriority;
+            }
+
+            const aTitle =
+              a.title ||
+              a.name ||
+              "";
+
+            const bTitle =
+              b.title ||
+              b.name ||
+              "";
+
+            return (
+              aTitle.length -
+              bTitle.length
+            );
+          });
+
+          const chineseTitle =
+            chineseTitles[0]?.title ||
+            chineseTitles[0]?.name;
+
+          if (chineseTitle) {
+
+            log(
+              "info",
+              `[system] [tmdb] 英文标题可靠转换: "${cleanTitle}" -> "${chineseTitle}" (作品: "${selectedTitle}")`
+            );
+
+            return chineseTitle;
+          }
+        }
+      }
+    }
+
+    // ---------------------------------
+    // 13. 如果没有 alternative_titles
+    //    使用 TMDB search 返回的中文标题
+    // ---------------------------------
+
+    const tmdbChineseTitle =
+      selectedResult.name ||
+      selectedResult.title ||
+      "";
+
+    if (
+      tmdbChineseTitle &&
+      !isNonChinese(tmdbChineseTitle)
+    ) {
+
+      log(
+        "info",
+        `[system] [tmdb] 使用 TMDB 条目自身中文标题: "${cleanTitle}" -> "${tmdbChineseTitle}"`
+      );
+
+      return tmdbChineseTitle;
+    }
+
+    // ---------------------------------
+    // 14. 最终安全兜底
+    // ---------------------------------
+
+    log(
+      "info",
+      `[system] [tmdb] 找不到可靠中文标题，保留原标题: "${originalInput}"`
+    );
+
+    return originalInput;
 
   } catch (error) {
-    log("error", '查询 TMDB 时出错:', error);
-    return title;
+
+    log(
+      "error",
+      `[system] [tmdb] 中文标题转换失败: ${error.message}`
+    );
+
+    return originalInput;
   }
+}
+
 }
 
 // =====================
